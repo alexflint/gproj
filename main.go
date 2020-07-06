@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,14 +18,6 @@ import (
 	"google.golang.org/api/serviceusage/v1"
 	"gopkg.in/yaml.v2"
 )
-
-type syncArgs struct {
-}
-
-type args struct {
-	Spec string    `help:"path to config file"`
-	Sync *syncArgs `arg:"subcommand"`
-}
 
 func findProjectSpec() (string, error) {
 	path, err := os.Getwd()
@@ -352,6 +345,67 @@ func sync(ctx context.Context, args *args) error {
 	return nil
 }
 
+func gcloud(ctx context.Context, args *args) error {
+	// read the project spec
+	spec, err := readProjectSpec(args.Spec)
+	if err != nil {
+		return err
+	}
+
+	// add --project=PROJECT unless there is already a --project argument manually provided
+	var hasProjectArg bool
+	for _, arg := range args.Gcloud.Args {
+		if strings.HasPrefix(arg, "--project") {
+			hasProjectArg = true
+			break
+		}
+	}
+
+	gcloudArgs := args.Gcloud.Args
+	if !hasProjectArg {
+		gcloudArgs = append([]string{"--project=" + spec.ID}, args.Gcloud.Args...)
+	}
+
+	// run the subcommand
+	gcloudPath, err := exec.LookPath("gcloud")
+	if err != nil {
+		return err
+	}
+
+	subcmd := exec.Command(gcloudPath, gcloudArgs...)
+	subcmd.Stdin = os.Stdin
+	subcmd.Stdout = os.Stdout
+	subcmd.Stderr = os.Stderr
+	err = subcmd.Run()
+
+	var exitCode int
+	if err != nil {
+		if e, ok := err.(*exec.ExitError); ok {
+			// this represents a non-zero exit code, so just pass it along
+			exitCode = e.ExitCode()
+		} else {
+			return fmt.Errorf("error executing 'gcloud %s': %w", strings.Join(gcloudArgs, " "), err)
+		}
+	}
+
+	// exit with withever exit code the subcommand gave
+	os.Exit(exitCode)
+	return nil
+}
+
+type syncArgs struct {
+}
+
+type gcloudArgs struct {
+	Args []string `arg:"positional"`
+}
+
+type args struct {
+	Spec   string      `help:"path to config file"`
+	Sync   *syncArgs   `arg:"subcommand"`
+	Gcloud *gcloudArgs `arg:"subcommand"`
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -363,6 +417,8 @@ func main() {
 	switch {
 	case args.Sync != nil:
 		err = sync(ctx, &args)
+	case args.Gcloud != nil:
+		err = gcloud(ctx, &args)
 	default:
 		p.Fail("you must specify a command")
 	}
