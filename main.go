@@ -390,6 +390,8 @@ func gcloud(ctx context.Context, args *args) error {
 
 	// exit with withever exit code the subcommand gave
 	os.Exit(exitCode)
+
+	// this is unreachable but we must return or else lint will complain
 	return nil
 }
 
