@@ -174,7 +174,7 @@ func sync(ctx context.Context, args *args) error {
 			for k, v := range spec.Labels {
 				project.Labels[k] = v
 			}
-			project.Labels["gproj-created-at"] = time.Now().String()
+			project.Labels["managed-by"] = "gproj"
 
 			// creating projects is a long-running operation so we have to poll
 			createOp, err := crmService.Projects.Create(project).Context(ctx).Do()
