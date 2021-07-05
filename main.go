@@ -19,6 +19,8 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+var ErrSpecNotFound = errors.New(".gproj file not found")
+
 func findProjectSpec() (string, error) {
 	path, err := os.Getwd()
 	if err != nil {
@@ -33,7 +35,7 @@ func findProjectSpec() (string, error) {
 
 		parent := filepath.Dir(path)
 		if parent == path {
-			return "", errors.New(".gproj file not found")
+			return "", ErrSpecNotFound
 		}
 
 		path = parent
@@ -56,7 +58,7 @@ func readProjectSpec(specPath string) (*ProjectSpec, error) {
 		var err error
 		specPath, err = findProjectSpec()
 		if err != nil {
-			return nil, fmt.Errorf("error finding project spec: %w", err)
+			return nil, fmt.Errorf("error finding project specification: %w", err)
 		}
 	}
 
@@ -348,7 +350,12 @@ func sync(ctx context.Context, args *args) error {
 func gcloud(ctx context.Context, args *args) error {
 	// read the project spec
 	spec, err := readProjectSpec(args.Spec)
-	if err != nil {
+	// if there is no .gcloud file so do nothing, or else "gcloud" will be inoperable
+	if errors.Is(err, ErrSpecNotFound) {
+		if args.Verbose {
+			fmt.Println("no .gcloud file found, ignoring")
+		}
+	} else if err != nil {
 		return err
 	}
 
@@ -362,7 +369,7 @@ func gcloud(ctx context.Context, args *args) error {
 	}
 
 	gcloudArgs := args.Gcloud.Args
-	if !hasProjectArg {
+	if !hasProjectArg && spec != nil {
 		gcloudArgs = append([]string{"--project=" + spec.ID}, args.Gcloud.Args...)
 	}
 
@@ -403,9 +410,10 @@ type gcloudArgs struct {
 }
 
 type args struct {
-	Spec   string      `help:"path to config file"`
-	Sync   *syncArgs   `arg:"subcommand"`
-	Gcloud *gcloudArgs `arg:"subcommand"`
+	Spec    string      `help:"path to config file"`
+	Sync    *syncArgs   `arg:"subcommand"`
+	Gcloud  *gcloudArgs `arg:"subcommand"`
+	Verbose bool
 }
 
 func main() {
