@@ -184,6 +184,12 @@ func available(ctx context.Context, args *args) error {
 }
 
 func apply(ctx context.Context, args *args) error {
+	// we do some hacky stuff to remove quota_project_id from the credentials json... ouch
+	creds, err := googleCredentials(ctx)
+	if err != nil {
+		return err
+	}
+
 	// find the project spec
 	spec, err := readProjectSpec(args.Spec)
 	if err != nil {
@@ -194,30 +200,18 @@ func apply(ctx context.Context, args *args) error {
 		return fmt.Errorf("project name %q invalid: must be at least 4 characters long (required by Google Cloud)", spec.Name)
 	}
 
-	// TODO: validate the spec
-
 	resources, err := cloudresourcemanager.NewService(ctx,
-		option.WithScopes(cloudresourcemanager.CloudPlatformScope))
+		option.WithScopes(cloudresourcemanager.CloudPlatformScope),
+		option.WithCredentials(creds))
 	if err != nil {
 		return err
 	}
 
-	// It seems that we need to have a project with cloud resource manager API already
-	// created in order to do this. But "gcloud projects create" seems to work even
-	// without a "master" project to work from
-
-	// here is how gcloud projects create works:
-	//   https://github.com/twistedpair/google-cloud-sdk/blob/master/google-cloud-sdk/lib/googlecloudsdk/surface/projects/create.py#L40
-	// and here is how the resource manager client is created:
-	//   https://github.com/twistedpair/google-cloud-sdk/blob/master/google-cloud-sdk/lib/googlecloudsdk/surface/projects/__init__.py#L22
-	// it might be significant that get_credentials is set to False in the above
-	// that parameter is processed by the google apitools logic here:
-	//   https://github.com/google/apitools/blob/master/apitools/base/py/base_api.py#L240
-	// in the end it triggers a call to _GetCredentials if it is set to true:
-	//   https://github.com/google/apitools/blob/31cad2d904f356872d2965687e84b2d87ee2cdd3/apitools/base/py/base_api.py#L312
-	// perhaps on the golang side we could try option.WithoutAuthentication but then how does authentication
-	// ultimately get in there?
-	//   https://pkg.go.dev/google.golang.org/api/option#WithoutAuthentication
+	// now enable the appropriate APIs
+	apiService, err := serviceusage.NewService(ctx)
+	if err != nil {
+		return fmt.Errorf("error initializing the service usage API: %w", err)
+	}
 
 	// fetch the project, creating it if necessary
 	project, err := resources.Projects.Get(spec.ID).Context(ctx).Do()
@@ -260,22 +254,34 @@ func apply(ctx context.Context, args *args) error {
 				return fmt.Errorf("error getting project info right after creating it: %w", err)
 			}
 
+			// enable the billing API, which we need in order to enable further APIs
+			projNum := formatProjectNumber(project.ProjectNumber)
+			enableOp, err := apiService.Services.BatchEnable(projNum, &serviceusage.BatchEnableServicesRequest{
+				ServiceIds: []string{"cloudbilling.googleapis.com"},
+			}).Context(ctx).Do()
+			if err != nil {
+				return fmt.Errorf("error in API call to enable APIs: %w", err)
+			}
+
+			err = waitForEnable(ctx, apiService.Operations, enableOp)
+			if err != nil {
+				return fmt.Errorf("error enabling billing API: %v", err)
+			}
+
 			fmt.Printf("created %s\n", spec.ID)
 		} else {
 			return err
 		}
 	}
 
-	// for the service API and billing API, we use a project identifier of the form "projects/<number>"
-	projNum := fmt.Sprintf("projects/%d", project.ProjectNumber)
-
 	// initialize the billing service
-	billing, err := cloudbilling.NewService(ctx)
+	billing, err := cloudbilling.NewService(ctx, option.WithCredentials(creds))
 	if err != nil {
 		return fmt.Errorf("error initializing the billing API: %w", err)
 	}
 
 	// get billing info for this account so that we know whether we need to change it
+	projNum := formatProjectNumber(project.ProjectNumber)
 	billingInfo, err := billing.Projects.GetBillingInfo(projNum).Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("error getting billing info for %s: %w", spec.ID, err)
@@ -329,12 +335,6 @@ func apply(ctx context.Context, args *args) error {
 		fmt.Println("updated billing info")
 	}
 
-	// now enable the appropriate APIs
-	apiService, err := serviceusage.NewService(ctx)
-	if err != nil {
-		return fmt.Errorf("error initializing the service usage API: %w", err)
-	}
-
 	// now make a list of APIs to enable
 	var toEnable []string
 	for _, requestedAPI := range spec.APIs {
@@ -348,7 +348,7 @@ func apply(ctx context.Context, args *args) error {
 	}
 
 	if len(toEnable) > 0 {
-		fmt.Printf("Enabling %d APIs:\n", len(toEnable))
+		fmt.Printf("enabling %d APIs:\n", len(toEnable))
 		for _, api := range toEnable {
 			fmt.Printf("  %s\n", api)
 		}
@@ -365,6 +365,7 @@ func apply(ctx context.Context, args *args) error {
 			return fmt.Errorf("error in API call to enable APIs: %w", err)
 		}
 
+		fmt.Println("this may take a minute or two...")
 		err = waitForEnable(ctx, apiService.Operations, enableOp)
 		if err != nil {
 			return fmt.Errorf("error enabling %d APIs: %w", len(toEnable), err)
@@ -462,7 +463,6 @@ func main() {
 	p := arg.MustParse(&args)
 
 	var err error
-
 	switch {
 	case args.Apply != nil:
 		err = apply(ctx, &args)
