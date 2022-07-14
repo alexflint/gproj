@@ -457,16 +457,50 @@ func cmdDelete(ctx context.Context, args *args) error {
 		return err
 	}
 
-	fmt.Printf("Project %s has been deleted. To undelete in the next 30 days, run gproj undelete\n", spec.ID)
+	fmt.Printf("Project %s has been deleted. To undelete in the next 30 days, run\n  $ gproj undelete\n", spec.ID)
 	return nil
+}
+
+func undelete(ctx context.Context, args *args) error {
+	// we do some hacky stuff to remove quota_project_id from the credentials json... ouch
+	creds, err := googleCredentials(ctx)
+	if err != nil {
+		return err
+	}
+
+	// find the project spec
+	spec, err := readProjectSpec(args.Spec)
+	if err != nil {
+		return err
+	}
+
+	resources, err := cloudresourcemanager.NewService(ctx,
+		option.WithScopes(cloudresourcemanager.CloudPlatformScope),
+		option.WithCredentials(creds))
+	if err != nil {
+		return err
+	}
+
+	req := cloudresourcemanager.UndeleteProjectRequest{}
+	_, err = resources.Projects.Undelete(spec.ID, &req).Context(ctx).Do()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Project %s successfully undeleted.\n", spec.ID)
+	return nil
+}
+
+// args for "gproj apply", which updates the project, the APIs, and the billing account
+type applyArgs struct {
 }
 
 // args for "gproj delete", which deletes the project
 type deleteArgs struct {
 }
 
-// args for "gproj apply", which updates the project, the APIs, and the billing account
-type applyArgs struct {
+// args for "gproj undelete", which undeletes a project (within 30 days of deletion)
+type undeleteArgs struct {
 }
 
 // args for "gproj available", which lists available APIs
@@ -485,6 +519,7 @@ type args struct {
 	Spec      string         `help:"path to config file"`
 	Apply     *applyArgs     `arg:"subcommand"`
 	Delete    *deleteArgs    `arg:"subcommand" help:"delete the current project"`
+	Undelete  *undeleteArgs  `arg:"subcommand" help:"un-delete the current project"`
 	Gcloud    *gcloudArgs    `arg:"subcommand"`
 	Available *availableArgs `arg:"subcommand" help:"list available APIs"`
 	Verbose   bool
@@ -502,6 +537,8 @@ func main() {
 		err = apply(ctx, &args)
 	case args.Delete != nil:
 		err = cmdDelete(ctx, &args)
+	case args.Undelete != nil:
+		err = undelete(ctx, &args)
 	case args.Gcloud != nil:
 		err = gcloud(ctx, &args)
 	case args.Available != nil:
