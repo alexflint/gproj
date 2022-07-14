@@ -290,7 +290,7 @@ func apply(ctx context.Context, args *args) error {
 	// find the requested billing account or look up the default
 	account := spec.Billing
 	if account == "enable" {
-		fmt.Println("no billing account in spec, looking up available billing accounts...")
+		fmt.Println("looking up available billing accounts...")
 		accounts, err := billing.BillingAccounts.List().Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("error listing billing accounts: %w", err)
@@ -305,7 +305,7 @@ func apply(ctx context.Context, args *args) error {
 		}
 
 		if len(openAccounts) == 1 {
-			fmt.Printf("using the only open billing account %q (%s)\n", openAccounts[0].Name, openAccounts[0].DisplayName)
+			fmt.Printf("using the only open billing account: %s (%s)\n", openAccounts[0].Name, openAccounts[0].DisplayName)
 			account = openAccounts[0].Name
 		} else {
 			return fmt.Errorf(
@@ -372,8 +372,9 @@ func apply(ctx context.Context, args *args) error {
 		}
 	}
 
-	// TODO: disable unused APIs
+	// TODO: disable API that have been removed from the config
 
+	fmt.Println("success")
 	return nil
 }
 

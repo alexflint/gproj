@@ -1,6 +1,7 @@
-name: Foo-Bar-Baz
-id: foo-abegh-123456
+name: "Project created by GPROJ"
+id: created-by-gproj
 billing: enable
 apis:
  - compute
  - container
+ - bigquery
