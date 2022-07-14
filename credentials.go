@@ -48,18 +48,13 @@ func googleCredentials(ctx context.Context, scopes ...string) (*google.Credentia
 		return nil, err
 	}
 
-	// now remove the quota_project_id part from the json
-	for _, pattern := range quotaProjectPatterns {
-		loc := pattern.FindIndex(creds.JSON)
-		if loc == nil {
-			continue
-		}
-
-		// remote the quota_project_id
-		buf := append(creds.JSON[:loc[0]], creds.JSON[loc[1]:]...)
-		return google.CredentialsFromJSON(ctx, buf, scopes...)
-	}
-
-	// there was no "quota_project_id" key
-	return creds, err
+	// Annoyingly, cloud resource manager fails if the application default credentials
+	// specify a project that does not explicitly have the cloud resource manager API
+	// enabled. But we are using cloud resource manager to *create* our project so we
+	// can hardly expect to already have a project with the appropriate APIs enabled.
+	// Cloud resource manager actually succeeds if *no* project is specified, but
+	// unfortunately we need to mess with the credentials object in order to do that:
+	creds.ProjectID = ""
+	creds.JSON = nil
+	return creds, nil
 }

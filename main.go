@@ -50,6 +50,7 @@ func findProjectSpec() (string, error) {
 type ProjectSpec struct {
 	Name    string            // human readable name of the project
 	ID      string            // ID of the project (must also be input by hand)
+	Number  int               // Project number (will be filled in by gcloud apply)
 	Labels  map[string]string // arbitrary key/value labels to assign to the project
 	APIs    []string
 	Billing string // ID of billing account, e.g. "012345-6789AB-CDEFG0" - leave empty to use default
@@ -110,7 +111,7 @@ func waitForCreate(
 		}
 	}
 
-	return errors.New("ticker chanel was closed")
+	return errors.New("ticker chanel was closed in waitForCreate")
 }
 
 func waitForEnable(
@@ -142,38 +143,48 @@ func waitForEnable(
 		}
 	}
 
-	return errors.New("ticker chanel was closed")
+	return errors.New("ticker chanel was closed in waitForEnable")
 }
 
-func available(ctx context.Context, args *args) error {
+func apis(ctx context.Context, args *args) error {
+	creds, err := googleCredentials(ctx)
+	if err != nil {
+		return err
+	}
+
 	// find the project spec
 	spec, err := readProjectSpec(args.Spec)
 	if err != nil {
 		return err
 	}
 
+	// create the resourcemanager service with which we will look up the project
 	resources, err := cloudresourcemanager.NewService(ctx,
-		option.WithScopes(cloudresourcemanager.CloudPlatformScope))
+		option.WithScopes(cloudresourcemanager.CloudPlatformScope),
+		option.WithCredentials(creds))
 	if err != nil {
 		return err
 	}
 
-	// fetch the project, creating it if necessary
+	// fetch the project
 	project, err := resources.Projects.Get(spec.ID).Context(ctx).Do()
 	if err != nil {
+		fmt.Println("error getting the project:", err)
 		return fmt.Errorf("cannot list the available APIs before the project has been created... eep sorry")
 	}
 
+	// fetch the list of available APIs from google cloud or from cache
 	apis, err := availableAPIs(ctx, project.ProjectNumber)
 	if err != nil {
 		return fmt.Errorf("error fetching available APIs: %w", err)
 	}
 
+	// print the APIs
 	for _, api := range apis {
-		if !strings.HasSuffix(api.Name, ".googleapis.com") && !args.Available.All {
+		if !strings.HasSuffix(api.Name, ".googleapis.com") && !args.APIs.All {
 			continue
 		}
-		if args.Available.Description {
+		if args.APIs.Description {
 			fmt.Printf("%-50s %s\n", api.Name, api.Summary)
 		} else {
 			fmt.Println(api.Name)
@@ -196,10 +207,6 @@ func apply(ctx context.Context, args *args) error {
 		return err
 	}
 
-	if len(spec.Name) < 4 {
-		return fmt.Errorf("project name %q invalid: must be at least 4 characters long (required by Google Cloud)", spec.Name)
-	}
-
 	resources, err := cloudresourcemanager.NewService(ctx,
 		option.WithScopes(cloudresourcemanager.CloudPlatformScope),
 		option.WithCredentials(creds))
@@ -208,7 +215,7 @@ func apply(ctx context.Context, args *args) error {
 	}
 
 	// now enable the appropriate APIs
-	apiService, err := serviceusage.NewService(ctx)
+	apis, err := serviceusage.NewService(ctx)
 	if err != nil {
 		return fmt.Errorf("error initializing the service usage API: %w", err)
 	}
@@ -217,10 +224,14 @@ func apply(ctx context.Context, args *args) error {
 	project, err := resources.Projects.Get(spec.ID).Context(ctx).Do()
 	if err != nil {
 		// we get "403 Forbidden" if the project does not exist since projects IDs
-		// are global and Google doesn't want to reveal if the project exists
+		// are global and Google doesn't want to reveal whether the project exists
 		// in someone else's account or not
 		if e, ok := err.(*googleapi.Error); ok && e.Code == 403 {
 			fmt.Printf("project %s does not exist, attempting to create it...\n", spec.ID)
+
+			if len(spec.Name) < 4 {
+				return fmt.Errorf("project name %q invalid: must be at least 4 characters long (required by Google Cloud)", spec.Name)
+			}
 
 			project = &cloudresourcemanager.Project{
 				Name:      spec.Name,
@@ -240,7 +251,7 @@ func apply(ctx context.Context, args *args) error {
 				return fmt.Errorf("error creating project: %w", err)
 			}
 
-			waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 
 			err = waitForCreate(waitCtx, resources.Operations, createOp)
@@ -256,19 +267,19 @@ func apply(ctx context.Context, args *args) error {
 
 			// enable the billing API, which we need in order to enable further APIs
 			projNum := formatProjectNumber(project.ProjectNumber)
-			enableOp, err := apiService.Services.BatchEnable(projNum, &serviceusage.BatchEnableServicesRequest{
+			enableOp, err := apis.Services.BatchEnable(projNum, &serviceusage.BatchEnableServicesRequest{
 				ServiceIds: []string{"cloudbilling.googleapis.com"},
 			}).Context(ctx).Do()
 			if err != nil {
 				return fmt.Errorf("error in API call to enable APIs: %w", err)
 			}
 
-			err = waitForEnable(ctx, apiService.Operations, enableOp)
+			err = waitForEnable(ctx, apis.Operations, enableOp)
 			if err != nil {
 				return fmt.Errorf("error enabling billing API: %v", err)
 			}
 
-			fmt.Printf("created %s\n", spec.ID)
+			fmt.Printf("created project %s\n", spec.ID)
 		} else {
 			return err
 		}
@@ -358,15 +369,18 @@ func apply(ctx context.Context, args *args) error {
 		}
 
 		// do a batch update
-		enableOp, err := apiService.Services.BatchEnable(projNum, &serviceusage.BatchEnableServicesRequest{
+		enableOp, err := apis.Services.BatchEnable(projNum, &serviceusage.BatchEnableServicesRequest{
 			ServiceIds: toEnable,
 		}).Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("error in API call to enable APIs: %w", err)
 		}
 
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute) // this can really take a while
+		defer cancel()
+
 		fmt.Println("this may take a minute or two...")
-		err = waitForEnable(ctx, apiService.Operations, enableOp)
+		err = waitForEnable(waitCtx, apis.Operations, enableOp)
 		if err != nil {
 			return fmt.Errorf("error enabling %d APIs: %w", len(toEnable), err)
 		}
@@ -504,8 +518,8 @@ type deleteArgs struct {
 type undeleteArgs struct {
 }
 
-// args for "gproj available", which lists available APIs
-type availableArgs struct {
+// args for "gproj apis", which lists available APIs
+type apisArgs struct {
 	All         bool `help:"Include third-party services"`
 	Description bool `help:"Print a line-line description of each API"`
 }
@@ -517,13 +531,13 @@ type gcloudArgs struct {
 
 // args for the top-level gproj command
 type args struct {
-	Spec      string         `help:"path to config file"`
-	Apply     *applyArgs     `arg:"subcommand"`
-	Delete    *deleteArgs    `arg:"subcommand" help:"delete the current project"`
-	Undelete  *undeleteArgs  `arg:"subcommand" help:"un-delete the current project"`
-	Gcloud    *gcloudArgs    `arg:"subcommand"`
-	Available *availableArgs `arg:"subcommand" help:"list available APIs"`
-	Verbose   bool
+	Spec     string        `help:"path to config file"`
+	Apply    *applyArgs    `arg:"subcommand"`
+	Delete   *deleteArgs   `arg:"subcommand" help:"delete the current project"`
+	Undelete *undeleteArgs `arg:"subcommand" help:"un-delete the current project"`
+	Gcloud   *gcloudArgs   `arg:"subcommand"`
+	APIs     *apisArgs     `arg:"subcommand" help:"list available APIs"`
+	Verbose  bool
 }
 
 func main() {
@@ -542,8 +556,8 @@ func main() {
 		err = undelete(ctx, &args)
 	case args.Gcloud != nil:
 		err = gcloud(ctx, &args)
-	case args.Available != nil:
-		err = available(ctx, &args)
+	case args.APIs != nil:
+		err = apis(ctx, &args)
 	default:
 		p.Fail("you must specify a command")
 	}
