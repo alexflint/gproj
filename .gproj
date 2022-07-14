@@ -1,5 +1,0 @@
-name: Test project for gproj
-id: new-scratch-12345
-apis:
- - artifactregistry
- - appsmarket

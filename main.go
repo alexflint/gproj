@@ -15,11 +15,14 @@ import (
 	"google.golang.org/api/cloudbilling/v1"
 	"google.golang.org/api/cloudresourcemanager/v1"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 	"google.golang.org/api/serviceusage/v1"
 	"gopkg.in/yaml.v2"
 )
 
-var ErrSpecNotFound = errors.New(".gproj file not found")
+const gprojFile = "googlecloudproject.yaml"
+
+var ErrSpecNotFound = errors.New(gprojFile + " file not found")
 
 func findProjectSpec() (string, error) {
 	path, err := os.Getwd()
@@ -28,7 +31,7 @@ func findProjectSpec() (string, error) {
 	}
 
 	for i := 0; i < 100; i++ {
-		x := filepath.Join(path, ".gproj")
+		x := filepath.Join(path, gprojFile)
 		if st, err := os.Stat(x); err == nil && st.Mode().IsRegular() {
 			return x, nil
 		}
@@ -43,7 +46,7 @@ func findProjectSpec() (string, error) {
 	return "", errors.New("took more than 100 steps up parent hierarchy")
 }
 
-// ProjectSpec models the .gproj file
+// ProjectSpec models the googlecloudproject.yaml file
 type ProjectSpec struct {
 	Name    string            // human readable name of the project
 	ID      string            // ID of the project (must also be input by hand)
@@ -142,23 +145,82 @@ func waitForEnable(
 	return errors.New("ticker chanel was closed")
 }
 
-func sync(ctx context.Context, args *args) error {
+func available(ctx context.Context, args *args) error {
 	// find the project spec
 	spec, err := readProjectSpec(args.Spec)
 	if err != nil {
 		return err
 	}
-	pretty.Println(spec)
 
-	// TODO: validate the spec
-
-	crmService, err := cloudresourcemanager.NewService(ctx)
+	resources, err := cloudresourcemanager.NewService(ctx,
+		option.WithScopes(cloudresourcemanager.CloudPlatformScope))
 	if err != nil {
 		return err
 	}
 
 	// fetch the project, creating it if necessary
-	project, err := crmService.Projects.Get(spec.ID).Context(ctx).Do()
+	project, err := resources.Projects.Get(spec.ID).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("cannot list the available APIs before the project has been created... eep sorry")
+	}
+
+	apis, err := availableAPIs(ctx, project.ProjectNumber)
+	if err != nil {
+		return fmt.Errorf("error fetching available APIs: %w", err)
+	}
+
+	for _, api := range apis {
+		if !strings.HasSuffix(api.Name, ".googleapis.com") && !args.Available.All {
+			continue
+		}
+		if args.Available.Description {
+			fmt.Printf("%-50s %s\n", api.Name, api.Summary)
+		} else {
+			fmt.Println(api.Name)
+		}
+	}
+
+	return nil
+}
+
+func apply(ctx context.Context, args *args) error {
+	// find the project spec
+	spec, err := readProjectSpec(args.Spec)
+	if err != nil {
+		return err
+	}
+
+	if len(spec.Name) < 4 {
+		return fmt.Errorf("project name %q invalid: must be at least 4 characters long (required by Google Cloud)", spec.Name)
+	}
+
+	// TODO: validate the spec
+
+	resources, err := cloudresourcemanager.NewService(ctx,
+		option.WithScopes(cloudresourcemanager.CloudPlatformScope))
+	if err != nil {
+		return err
+	}
+
+	// It seems that we need to have a project with cloud resource manager API already
+	// created in order to do this. But "gcloud projects create" seems to work even
+	// without a "master" project to work from
+
+	// here is how gcloud projects create works:
+	//   https://github.com/twistedpair/google-cloud-sdk/blob/master/google-cloud-sdk/lib/googlecloudsdk/surface/projects/create.py#L40
+	// and here is how the resource manager client is created:
+	//   https://github.com/twistedpair/google-cloud-sdk/blob/master/google-cloud-sdk/lib/googlecloudsdk/surface/projects/__init__.py#L22
+	// it might be significant that get_credentials is set to False in the above
+	// that parameter is processed by the google apitools logic here:
+	//   https://github.com/google/apitools/blob/master/apitools/base/py/base_api.py#L240
+	// in the end it triggers a call to _GetCredentials if it is set to true:
+	//   https://github.com/google/apitools/blob/31cad2d904f356872d2965687e84b2d87ee2cdd3/apitools/base/py/base_api.py#L312
+	// perhaps on the golang side we could try option.WithoutAuthentication but then how does authentication
+	// ultimately get in there?
+	//   https://pkg.go.dev/google.golang.org/api/option#WithoutAuthentication
+
+	// fetch the project, creating it if necessary
+	project, err := resources.Projects.Get(spec.ID).Context(ctx).Do()
 	if err != nil {
 		// we get "403 Forbidden" if the project does not exist since projects IDs
 		// are global and Google doesn't want to reveal if the project exists
@@ -179,7 +241,7 @@ func sync(ctx context.Context, args *args) error {
 			project.Labels["managed-by"] = "gproj"
 
 			// creating projects is a long-running operation so we have to poll
-			createOp, err := crmService.Projects.Create(project).Context(ctx).Do()
+			createOp, err := resources.Projects.Create(project).Context(ctx).Do()
 			if err != nil {
 				return fmt.Errorf("error creating project: %w", err)
 			}
@@ -187,13 +249,13 @@ func sync(ctx context.Context, args *args) error {
 			waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 
-			err = waitForCreate(waitCtx, crmService.Operations, createOp)
+			err = waitForCreate(waitCtx, resources.Operations, createOp)
 			if err != nil {
 				return fmt.Errorf("error creating project: %w", err)
 			}
 
 			// now fetch the final project info containing the data filled in by the server
-			project, err = crmService.Projects.Get(spec.ID).Context(ctx).Do()
+			project, err = resources.Projects.Get(spec.ID).Context(ctx).Do()
 			if err != nil {
 				return fmt.Errorf("error getting project info right after creating it: %w", err)
 			}
@@ -208,22 +270,22 @@ func sync(ctx context.Context, args *args) error {
 	projNum := fmt.Sprintf("projects/%d", project.ProjectNumber)
 
 	// initialize the billing service
-	billingService, err := cloudbilling.NewService(ctx)
+	billing, err := cloudbilling.NewService(ctx)
 	if err != nil {
 		return fmt.Errorf("error initializing the billing API: %w", err)
 	}
 
 	// get billing info for this account so that we know whether we need to change it
-	billing, err := billingService.Projects.GetBillingInfo(projNum).Context(ctx).Do()
+	billingInfo, err := billing.Projects.GetBillingInfo(projNum).Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("error getting billing info for %s: %w", spec.ID, err)
 	}
 
 	// find the requested billing account or look up the default
 	account := spec.Billing
-	if account == "" {
+	if account == "enable" {
 		fmt.Println("no billing account in spec, looking up available billing accounts...")
-		accounts, err := billingService.BillingAccounts.List().Context(ctx).Do()
+		accounts, err := billing.BillingAccounts.List().Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("error listing billing accounts: %w", err)
 		}
@@ -248,9 +310,9 @@ func sync(ctx context.Context, args *args) error {
 	}
 
 	// update the billing account
-	if billing.BillingAccountName != account {
+	if billingInfo.BillingAccountName != account {
 		fmt.Printf("updating billing account to %s\n", account)
-		updatedBilling, err := billingService.Projects.UpdateBillingInfo(projNum, &cloudbilling.ProjectBillingInfo{
+		updatedBilling, err := billing.Projects.UpdateBillingInfo(projNum, &cloudbilling.ProjectBillingInfo{
 			BillingAccountName: account,
 		}).Context(ctx).Do()
 		if err != nil {
@@ -273,35 +335,6 @@ func sync(ctx context.Context, args *args) error {
 		return fmt.Errorf("error initializing the service usage API: %w", err)
 	}
 
-	apiList, err := apiService.Services.List(projNum).Do()
-	if err != nil {
-		return fmt.Errorf("error getting list of enabled services for %s: %w", project.ProjectId, err)
-	}
-
-	// next make a map from API to enabled/disabled
-	type api struct {
-		name    string // machine readable name, e.g. "billingbudgets.googleapis.com"
-		title   string // human readable name, e.g. "Cloud Billing API"
-		summary string // one sentence description of the API
-		enabled bool
-		service *serviceusage.GoogleApiServiceusageV1ServiceConfig // note that most of these fields seem to be empty for most APIs
-	}
-
-	apis := make(map[string]*api)
-	for _, s := range apiList.Services {
-		// note that s.Name is of the form "projects/123/services/foo.googleapis.com"
-		// while s.Config.Name is of the form "foo.googleapis.com"
-		apis[s.Config.Name] = &api{
-			name:    s.Config.Name,
-			title:   s.Config.Title,
-			enabled: s.State == "ENABLED",
-			service: nil, //s.Config,
-		}
-		if s.Config.Documentation != nil {
-			apis[s.Config.Name].summary = s.Config.Documentation.Summary
-		}
-	}
-
 	// now make a list of APIs to enable
 	var toEnable []string
 	for _, requestedAPI := range spec.APIs {
@@ -311,13 +344,7 @@ func sync(ctx context.Context, args *args) error {
 			requestedAPI = repl
 		}
 
-		info, ok := apis[requestedAPI]
-		if !ok {
-			return fmt.Errorf("no such API: %s", requestedAPI)
-		}
-		if !info.enabled {
-			toEnable = append(toEnable, requestedAPI)
-		}
+		toEnable = append(toEnable, requestedAPI)
 	}
 
 	if len(toEnable) > 0 {
@@ -343,6 +370,8 @@ func sync(ctx context.Context, args *args) error {
 			return fmt.Errorf("error enabling %d APIs: %w", len(toEnable), err)
 		}
 	}
+
+	// TODO: disable unused APIs
 
 	return nil
 }
@@ -402,18 +431,28 @@ func gcloud(ctx context.Context, args *args) error {
 	return nil
 }
 
-type syncArgs struct {
+// args for "gproj apply", which update the project, the APIs, and the billing account
+type applyArgs struct {
 }
 
+// args for "gproj available", which lists available APIs
+type availableArgs struct {
+	All         bool `help:"Include third-party services"`
+	Description bool `help:"Print a line-line description of each API"`
+}
+
+// args for "gproj gcloud", which calls gcloud with a --project and --account added
 type gcloudArgs struct {
 	Args []string `arg:"positional"`
 }
 
+// args for the top-level gproj command
 type args struct {
-	Spec    string      `help:"path to config file"`
-	Sync    *syncArgs   `arg:"subcommand"`
-	Gcloud  *gcloudArgs `arg:"subcommand"`
-	Verbose bool
+	Spec      string         `help:"path to config file"`
+	Apply     *applyArgs     `arg:"subcommand"`
+	Gcloud    *gcloudArgs    `arg:"subcommand"`
+	Available *availableArgs `arg:"subcommand" help:"list available APIs"`
+	Verbose   bool
 }
 
 func main() {
@@ -425,16 +464,22 @@ func main() {
 	var err error
 
 	switch {
-	case args.Sync != nil:
-		err = sync(ctx, &args)
+	case args.Apply != nil:
+		err = apply(ctx, &args)
 	case args.Gcloud != nil:
 		err = gcloud(ctx, &args)
+	case args.Available != nil:
+		err = available(ctx, &args)
 	default:
 		p.Fail("you must specify a command")
 	}
 
 	if err != nil {
-		fmt.Println(err)
+		msg := err.Error()
+		if !strings.HasPrefix(msg, "error") {
+			msg = "error: " + msg
+		}
+		fmt.Println(msg)
 		os.Exit(1)
 	}
 }

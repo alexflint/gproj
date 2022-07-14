@@ -1,0 +1,6 @@
+name: Foo-Bar-Baz
+id: foo-abegh-123456
+billing: enable
+apis:
+ - compute
+ - container
